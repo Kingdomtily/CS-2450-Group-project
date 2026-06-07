@@ -1,0 +1,257 @@
+import tkinter as tk
+from tkinter import ttk
+from tkinter.scrolledtext import ScrolledText
+from tkinter import Menu, messagebox
+from tkinter.constants import RIGHT
+
+
+class MemoryPanel:
+    """
+    Displays and allows editing of the simulator's 100 memory locations.
+
+    Shows memory contents in a scrollable, editable text area (address: value format).
+    Supports cut/copy/paste via keyboard shortcuts and right-click menu.
+    Automatically refreshes display from backend memory (when not being edited).
+    Changes made in the editor are synced back to the backend memory array.
+    Enforces 100-location limit during paste operations.
+    """
+
+    def __init__(self, master, interface_with_backend):
+        """
+        Initialize the memory panel UI and set up editing/clipboard features.
+
+        Args:
+            master: Parent Tkinter widget/container
+            interface_with_backend: UVSim/CPU instance providing access to memory
+        """
+        self.master = master
+        self.input_to = interface_with_backend
+        self.memory_ref = self.input_to.memory.main_memory()
+
+
+        self.program_canvas = tk.Canvas(self.master)
+        self.scrollbar = ttk.Scrollbar(self.master, command=self.on_scroll)
+        self.program_frame = ttk.Frame(self.program_canvas)
+
+        self.program_canvas.create_window(
+            (0, 0), 
+            window=self.program_frame, 
+            anchor = "nw",
+            tags="program_window")
+        self.program_canvas.configure(yscrollcommand=self.scrollbar.set)
+
+        def on_program_canvas_configure(event):
+            canvas_width = event.width
+            self.program_canvas.itemconfig("program_window", width=canvas_width)
+
+        self.program_canvas.bind("<Configure>",
+                                     on_program_canvas_configure)
+        self.program_canvas.bind_all("<MouseWheel>", 
+                                        lambda e: self.program_canvas.yview_scroll(
+                                            int(-1*(e.delta/120)), "units"))
+
+        #Make sure the program_frame still scrolls when program_canvas resizes:
+        self.program_frame.bind("<Configure>", 
+                                lambda e: self.program_canvas.configure(
+                                    scrollregion=self.program_canvas.bbox("all")))
+        
+        self.scrollbar.pack(side="right", fill="y")
+        self.program_canvas.pack(fill="both", expand=True)
+
+        self.labels_frame = tk.Frame(self.program_frame)#.pack(fill="x")
+
+        tk.Label( #Address Label
+            self.labels_frame,
+            height=1,
+            width=7,
+            text="Address"
+        ).pack(side="left")#.grid(row=0, column=0, sticky="nsew")
+        tk.Label( #Program Label
+            self.labels_frame,
+            height=1,
+            text="      Program",
+            # justify="left", #TODO: justify not working, come back to this
+            #bg="green"
+        ).pack(side="left", fill="both", expand=True)#.grid(row=0, column=1, sticky="nsew")
+
+        self.labels_frame.pack(fill="x")
+
+
+        self.address_program_frame = tk.Frame(self.program_frame, bg="green")
+
+        self.address_box = tk.Label( #renamed from "indexes_box"
+            self.address_program_frame,
+            width=7,
+            background="light grey",
+            fg="black",
+            font=("consolas", 10),
+            justify="center",
+            text='\n'.join([str(n) for n in range(250)])
+        )
+                
+        self.address_box.pack(side="left", anchor="nw")
+
+
+        #TODO: program_box needn't be scrollable anymore on its own.
+
+        self.program_box = tk.Text( #renamed from "memory_box"
+            self.address_program_frame,
+            bg="dark grey",
+            fg="white",
+            font=("consolas", 10),
+            wrap="none",
+            insertbackground="white",
+            selectbackground="#3399ff",
+            selectforeground="white",
+            undo=True,
+            maxundo=-1
+        )
+        self.program_box.pack(anchor="nw", fill="both", expand=True)
+        self.address_program_frame.pack(fill="both", expand=True)
+
+
+        self.program_box.config(state="normal")
+
+        self.program_box.bind("<Control-c>", self.copy)
+        self.program_box.bind("<Control-x>", self.cut)
+        self.program_box.bind("<Control-v>", self.paste)
+        self.program_box.bind("<Key>", self.schedule_sync)
+
+        self.context_menu = Menu(self.master, tearoff=0)
+        self.context_menu.add_command(label="Copy", command=self.copy)
+        self.context_menu.add_command(label="Cut", command=self.cut)
+        self.context_menu.add_command(label="Paste", command=self.paste)
+        self.program_box.bind("<Button-3>", self.show_context_menu)
+        self.program_box.bind("<Return>", self._on_enter)
+
+        self.refresh_memory()
+        self.auto_refresh_id = None
+        self.auto_refresh()
+    
+    def on_scroll(self, *args):
+        self.program_box.yview(*args)
+        self.address_box.yview(*args)
+
+    def show_context_menu(self, event):
+        """Display the right-click context menu at the mouse position."""
+        try:
+            self.context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.context_menu.grab_release()
+
+    def copy(self, event=None):
+        """Copy currently selected text to the system clipboard."""
+        try:
+            self.master.clipboard_clear()
+            self.master.clipboard_append(self.program_box.selection_get())
+        except tk.TclError:
+            pass
+        return "break"
+
+    def cut(self, event=None):
+        """Cut selected text (copy to clipboard + delete from editor)."""
+        self.copy()
+        try:
+            self.program_box.delete("sel.first", "sel.last")
+            self.schedule_sync()
+        except tk.TclError:
+            pass
+        return "break"
+
+    def paste(self, event=None):
+        """
+        Paste clipboard content at cursor position.
+        Checks that total lines won't exceed memory cap.
+        """
+        try:
+            clipboard = self.master.clipboard_get()
+            lines = [line.strip() for line in clipboard.splitlines() if line.strip()]
+
+            if not lines:
+                return "break"
+
+            current_lines = self.program_box.get("1.0", tk.END).strip().splitlines()
+            current_count = len([l for l in current_lines if l.strip()])
+
+            if current_count + len(lines) > self.input_to.memory.memory_cap:
+                messagebox.showwarning("Memory Limit", f"Cannot paste: would exceed {self.input_to.memory.memory_cap} memory locations.")
+                return "break"
+
+            self.program_box.insert(tk.INSERT, clipboard)
+            self.schedule_sync()
+
+        except tk.TclError:
+            pass
+        return "break"
+
+    def schedule_sync(self, event=None):
+        """Delay backend memory sync by 300ms to batch rapid edits and reduce lag."""
+        if hasattr(self, 'sync_after_id'):
+            self.master.after_cancel(self.sync_after_id)
+        self.sync_after_id = self.master.after(300, self.update_memory_from_text)
+
+    def update_memory_from_text(self):
+        """
+        Parse current text content of the editor and update backend memory array.
+        Clears memory first, then sets values from each line (after colon if present).
+        Invalid lines are ignored (left as 0).
+        """
+
+        text_lines = self.program_box.get("1.0", tk.END).strip().splitlines()
+
+        # Clear memory in place first
+        for i in range(len(self.memory_ref)):
+            self.memory_ref[i] = 0
+
+        # Write each line's value back by index, skipping blank lines
+        for i, line in enumerate(text_lines):
+            if i >= len(self.memory_ref):
+                break
+            line = line.strip()
+            if not line:
+                self.memory_ref[i] = 0
+                continue
+            try:
+                self.memory_ref[i] = int(line)
+            except ValueError:
+                pass
+
+    def refresh_memory(self):
+        """
+        Update editor content from backend memory if not currently focused.
+        Preserves scroll position and cursor location when possible.
+        """
+        if self.program_box.focus_get() == self.program_box:
+            return
+        
+        scroll_pos = self.program_box.yview()
+
+        memory_text = "\n".join(
+            str(data) if data is not None else "0"
+            for data in self.memory_ref
+        )
+
+        current = self.program_box.get("1.0", tk.END).rstrip('\n')
+        if current != memory_text:
+            pos = self.program_box.index(tk.INSERT)
+            self.program_box.delete("1.0", tk.END)
+            self.program_box.insert("1.0", memory_text)
+            try:
+                self.program_box.mark_set(tk.INSERT, pos)
+            except:
+                pass
+
+        self.program_box.yview_moveto(scroll_pos[0])
+
+    def auto_refresh(self):
+        """Periodically refresh display from backend memory (every 800ms)."""
+        self.refresh_memory()
+        self.auto_refresh_id = self.master.after(800, self.auto_refresh)
+
+    def _on_enter(self, event=None):
+        '''Moves cursor to next line without inserting a newline character.'''
+        current_line = int(self.program_box.index(tk.INSERT).split(".")[0])
+        next_line = current_line + 1
+        self.program_box.mark_set(tk.INSERT, f"{next_line}.0")
+        self.program_box.see(f"{next_line}.0")
+        return "break"
